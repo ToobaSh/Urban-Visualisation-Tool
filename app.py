@@ -2,7 +2,6 @@ import os
 import math
 import json
 import base64
-import time
 from datetime import datetime
 
 import requests
@@ -22,125 +21,74 @@ st.set_page_config(
 
 
 # ======================================
-# Geocoding helpers
+# Secrets helpers
 # ======================================
-def geocode_nominatim(address: str, retries=2, delay=1):
-    """Return {lat, lon, label} using Nominatim, or None."""
+def get_secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return os.getenv(name, default)
+
+
+# ======================================
+# Geocoding with Geoapify
+# ======================================
+def geocode_geoapify(address: str):
+    """Return {lat, lon, label} using Geoapify."""
     if not address:
         return None
 
-    url = "https://nominatim.openstreetmap.org/search"
+    api_key = get_secret("GEOAPIFY_API_KEY")
+
+    if not api_key:
+        st.error("Missing GEOAPIFY_API_KEY. Add it in Streamlit Cloud secrets.")
+        return None
+
+    url = "https://api.geoapify.com/v1/geocode/search"
 
     params = {
-        "q": address,
+        "text": address,
+        "apiKey": api_key,
+        "limit": 1,
         "format": "json",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-
-    headers = {
-        "User-Agent": "tooba-urban-visualisation-tool/1.0 contact:demo@example.com"
-    }
-
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=20)
-
-            if r.status_code != 200:
-                st.warning(f"Nominatim status code: {r.status_code}")
-                st.write("Nominatim response:", r.text[:300])
-                return None
-
-            data = r.json()
-
-            if data:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                label = data[0].get("display_name", address)
-                return {"lat": lat, "lon": lon, "label": label, "source": "Nominatim"}
-
-            return None
-
-        except Exception as e:
-            if i == retries - 1:
-                st.warning(f"Nominatim error: {e}")
-                return None
-            time.sleep(delay)
-
-    return None
-
-
-def geocode_photon(address: str):
-    """Fallback geocoder using Photon."""
-    if not address:
-        return None
-
-    url = "https://photon.komoot.io/api/"
-
-    params = {
-        "q": address,
-        "limit": 1,
-        "lang": "en",
     }
 
     try:
         r = requests.get(url, params=params, timeout=20)
-
-        if r.status_code != 200:
-            st.warning(f"Photon status code: {r.status_code}")
-            return None
+        r.raise_for_status()
 
         data = r.json()
-        features = data.get("features", [])
+        results = data.get("results", [])
 
-        if not features:
+        if not results:
             return None
 
-        feature = features[0]
-        lon, lat = feature["geometry"]["coordinates"]
-
-        props = feature.get("properties", {})
-        label_parts = [
-            props.get("name"),
-            props.get("street"),
-            props.get("city"),
-            props.get("country"),
-        ]
-        label = ", ".join([x for x in label_parts if x])
+        result = results[0]
 
         return {
-            "lat": float(lat),
-            "lon": float(lon),
-            "label": label or address,
-            "source": "Photon",
+            "lat": float(result["lat"]),
+            "lon": float(result["lon"]),
+            "label": result.get("formatted", address),
+            "source": "Geoapify",
         }
 
     except Exception as e:
-        st.warning(f"Photon error: {e}")
+        st.error(f"Geoapify geocoding error: {e}")
         return None
 
 
-def geocode_address(address: str):
-    """Try Nominatim first, then Photon."""
-    geo = geocode_nominatim(address)
-
-    if geo:
-        return geo
-
-    st.info("Nominatim did not return a result. Trying Photon fallback...")
-    return geocode_photon(address)
-
-
 # ======================================
-# Mapillary helpers
+# Helpers
 # ======================================
 def _deg_for_meters(lat_deg: float, meters: float):
+    """Approximate lat/lon offsets in degrees for given meters."""
     dlat = meters / 111_320.0
     dlon = dlat * math.cos(math.radians(lat_deg))
     return dlat, dlon
 
 
 def _haversine_m(lat1, lon1, lat2, lon2):
+    """Distance in meters between two lat/lon points."""
     from math import radians, sin, cos, asin, sqrt
 
     R = 6371000.0
@@ -215,8 +163,8 @@ def mapillary_find_best(
                 it = ranked[0][2]
                 return it.get("thumb_1024_url") or it.get("thumb_2048_url"), it
 
-    except Exception as e:
-        st.warning(f"Mapillary closeto search error: {e}")
+    except Exception:
+        pass
 
     for radius in radii_m:
         dlat, dlon = _deg_for_meters(lat, radius)
@@ -264,6 +212,7 @@ def render_map(lat: float, lon: float, label: str = "", zoom: int = 18):
 
 
 def _fmt_date(value) -> str:
+    """Handle Mapillary date strings or timestamps safely."""
     if not value:
         return ""
 
@@ -311,7 +260,7 @@ def pannellum_html_from_image_bytes(img_bytes: bytes, height_px: int = 480) -> s
 
 
 # ======================================
-# App UI
+# App
 # ======================================
 st.title("🗺️ Mapillary Street Explorer")
 st.caption("Type an address, see a map, nearest Mapillary photo, and an inline 360° view when available.")
@@ -319,10 +268,7 @@ st.caption("Type an address, see a map, nearest Mapillary photo, and an inline 3
 with st.sidebar:
     st.header("Settings")
 
-    try:
-        default_token = st.secrets.get("MAPILLARY_TOKEN", "")
-    except Exception:
-        default_token = os.getenv("MAPILLARY_TOKEN", "")
+    default_token = get_secret("MAPILLARY_TOKEN", "")
 
     token = st.text_input(
         "Mapillary access token",
@@ -332,6 +278,11 @@ with st.sidebar:
     )
 
     pano_first = st.checkbox("Prefer panoramic images", value=True)
+
+    st.markdown(
+        "Get a token from your Mapillary account. It must start with `MLY|`.",
+        help="https://www.mapillary.com/dashboard/developers",
+    )
 
 address = st.text_input(
     "Address",
@@ -353,7 +304,7 @@ if search:
         st.error("Please provide a valid Mapillary token. It must start with 'MLY|'.")
         st.stop()
 
-    geo = geocode_address(address.strip())
+    geo = geocode_geoapify(address.strip())
 
     if not geo:
         st.error("Address not found. Try a more precise address, for example: Tour Eiffel, Paris, France")
